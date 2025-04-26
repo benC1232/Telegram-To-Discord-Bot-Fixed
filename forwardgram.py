@@ -80,6 +80,11 @@ async def background_task():
 
 @discord_client.event
 async def on_ready():
+    activity = discord.Activity(
+        type=discord.ActivityType.Watching,  # Could also be playing, listening, competing
+        name="made with <3 by oballa & shapiros_"
+    )
+    await discord_client.change_presence(status=discord.Status.online, activity=activity)
     print(f'Logged in as {discord_client.user}')
     discord_client.loop.create_task(background_task())
 
