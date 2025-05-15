@@ -88,6 +88,9 @@ async def background_task():
                             if msg["type"] in ("red alert map", "red alert info") and msg["timestamp"] >= five_minutes_ago
                         ]
 
+                        if len(to_delete_messages) > 1 and  to_delete_messages[-1]["type"] == "red alert info":
+                            to_delete_messages.pop()
+
                         sent_messages = [msg for msg in sent_messages if msg not in to_delete_messages]
 
                         for sent in to_delete_messages:
