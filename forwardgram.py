@@ -3,6 +3,7 @@ import yaml
 import discord
 import asyncio
 import os
+import time
 
 key_value_dict = {
         'בהמשך לדיווח על הפעלת התרעה על כניסת כלי טיס עוין לשמי ישראל - האירוע הסתיים.': ['Following the report on the activation of an alert for the entry of hostile aircraft into Israeli airspace - the event has concluded.', "./resources/aircraft.png"],
@@ -16,6 +17,7 @@ def shapira_parse(response):
     return response, None
 
 queue = []
+sent_messages = []
 
 with open('config.yml', 'rb') as f:
     config = yaml.safe_load(f)
@@ -23,6 +25,7 @@ with open('config.yml', 'rb') as f:
 client = TelegramClient("forwardgram", config["api_id"], config["api_hash"])
 
 intents = discord.Intents.default()
+intents.message_content = True
 discord_client = discord.Client(intents=intents)
 
 async def background_task():
@@ -48,23 +51,48 @@ async def background_task():
                 file = discord.File(file_path)
 
             try:
-                embed = discord.Embed(color=discord.Color.red())
-                if message:
-                    lines = message.splitlines()
-                    if lines:
-                        title = lines[0]
-                        rest = "\n".join(lines[1:]) if len(lines) > 1 else ""
-                        embed.description = f"# {title}\n\n{rest}".strip()
+                if item.get("type") == "mannie link":
+                    sent_msg = await discord_channel.send(content=message)
+                else:
+                    embed = discord.Embed(color=discord.Color.red())
+                    if message:
+                        lines = message.splitlines()
+                        if lines:
+                            title = lines[0]
+                            rest = "\n".join(lines[1:]) if len(lines) > 1 else ""
+                            embed.description = f"# {title}\n\n{rest}".strip()
 
-                if file:
-                    embed.set_image(url=f"attachment://{os.path.basename(file_path)}")
+                    if file:
+                        embed.set_image(url=f"attachment://{os.path.basename(file_path)}")
 
-                embed.set_footer(
-                    text="The bot does not necessarily provide accurate information. Rely on official information from the Home Front Command.",
-                    icon_url="https://cdn.discordapp.com/attachments/1160489865004187698/1365651059799883796/memed-io-output1.jpeg?ex=680e1529&is=680cc3a9&hm=a405bffc37aae3934396dc534f2234bcd0ec934bb17d650fe5273056cff9c773&"
-                )
+                    embed.set_footer(
+                        text="The bot does not necessarily provide accurate information. Rely on official information from the Home Front Command.",
+                        icon_url="https://cdn.discordapp.com/emojis/1269243394333343856.webp"
+                    )
 
-                await discord_channel.send(embed=embed, file=file if file else None)
+                    sent_msg = await discord_channel.send(embed=embed, file=file if file else None)
+
+                    global sent_messages
+                    msg_type = item.get("type")
+                    timestamp = time.time()
+                    sent_messages.append({
+                        "id": sent_msg.id,
+                        "timestamp": timestamp,
+                        "type": msg_type
+                    })
+
+                    if msg_type == "red alert map":
+                        five_minutes_ago = timestamp - 240
+                        to_delete_messages = [
+                            msg for msg in sent_messages[:-2]
+                            if msg["type"] in ("red alert map", "red alert info") and msg["timestamp"] >= five_minutes_ago
+                        ]
+
+                        sent_messages = [msg for msg in sent_messages if msg not in to_delete_messages]
+
+                        for sent in to_delete_messages:
+                            temp = await discord_channel.fetch_message(sent["id"])
+                            await temp.delete()
 
             except Exception as e:
                 print(f"Error sending embed: {e}")
@@ -80,17 +108,26 @@ async def background_task():
 
 @discord_client.event
 async def on_ready():
-    activity = discord.Activity(
-        type=discord.ActivityType.Watching,  # Could also be playing, listening, competing
-        name="made with <3 by oballa & shapiros_"
-    )
-    await discord_client.change_presence(status=discord.Status.online, activity=activity)
     print(f'Logged in as {discord_client.user}')
     discord_client.loop.create_task(background_task())
 
 @client.on(events.NewMessage())
 async def handler(event):
     if event.chat_id not in input_channel_ids:
+        return
+
+    chat = await event.get_chat()
+
+    if chat.title == "Mannie's War Room":
+        username = chat.username
+        if username:
+            msg_link = f"https://t.me/{username}/{event.message.id}"
+            queue.append({
+                "message": msg_link,
+                "file_path": None,
+                "download_media": None,
+                "type": "mannie link"
+            })
         return
 
     file_path = None
@@ -123,24 +160,34 @@ async def handler(event):
         blacklist = all(substring not in parsed_response for substring in substrings)
 
     if blacklist:
-        if override_file_path:  # Override if shapira_parse provided a file
+        if parsed_response and override_file_path:  # Override if shapira_parse provided a file
             queue.append({
                 "message": parsed_response,
                 "file_path": override_file_path,
-                "download_media": None  # No need to download, the file is local
+                "download_media": None,  # No need to download, the file is local
+                "type": "incident ended"
+            })
+        elif parsed_response and file_path:
+            queue.append({
+                "message": parsed_response,
+                "file_path": file_path,
+                "download_media": event.message.download_media(file_path),
+                "type": "tzofar early warning"
             })
         elif file_path:
             # Enqueue the coroutine for downloading, not the result
             queue.append({
                 "message": parsed_response,
                 "file_path": file_path,
-                "download_media": event.message.download_media(file_path)
+                "download_media": event.message.download_media(file_path),
+                "type": "red alert map"
             })
         else:
             queue.append({
                 "message": parsed_response,
                 "file_path": None,
-                "download_media": None
+                "download_media": None,
+                "type": "red alert info"
             })
 
 
@@ -161,7 +208,7 @@ async def main():
         exit()
 
     await asyncio.gather(
-        discord_client.start(config["discord_bot_token"]),
+        discord_client.start(config["discord_bot_token"], reconnect=True),
         client.run_until_disconnected()
     )
 
