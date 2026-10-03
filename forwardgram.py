@@ -1,219 +1,183 @@
-from telethon import TelegramClient, events
-import yaml
-import discord
+"""Forward messages from selected Telegram channels to a Discord channel.
+
+Telegram handler  ->  asyncio.Queue[Post]  ->  Discord sender
+"""
+
 import asyncio
+import logging
 import os
-import time
+from dataclasses import dataclass
 
-key_value_dict = {
-        'בהמשך לדיווח על הפעלת התרעה על כניסת כלי טיס עוין לשמי ישראל - האירוע הסתיים.': ['Following the report on the activation of an alert for the entry of hostile aircraft into Israeli airspace - the event has concluded.', "./resources/aircraft.png"],
-        'נשלל חשש לאירוע חדירת מחבלים': ['The concern of a terrorist infiltration has been ruled out. Residents can leave their homes and move around the area without restrictions.', "./resources/terrorist.png"],
-    }
+import discord
+import yaml
+from telethon import TelegramClient, events
+from telethon.tl.custom import Message
 
-def shapira_parse(response):
-    for key, value in key_value_dict.items():
-        if key in response:
-            return value[0], value[1]
-    return response, None
+CONFIG_PATH = "config.yml"
+SESSION_NAME = "forwardgram"
+DOWNLOADS_DIR = "downloads"
 
-queue = []
-sent_messages = []
+# Messages from this channel are posted as a t.me link instead of an embed.
+LINK_ONLY_CHANNEL = "Mannie's War Room"
+FOILED_GIF = "https://tenor.com/view/foiled-cat-funny-cat-meme-cute-gif-4770784610413068186"
 
-with open('config.yml', 'rb') as f:
-    config = yaml.safe_load(f)
+# Embeds are skipped when their text contains any of these.
+BLOCKED_WORDS = (
+    "עדכון", "תרגיל", "חומרים", "ראיתם", "חדירת", "ירי",
+    "שבת", "מוגן", "הנחיות", "פיקוד", "Team", "כלי טיס",
+)
 
-client = TelegramClient("forwardgram", config["api_id"], config["api_hash"])
+FOOTER_TEXT = (
+    "The bot does not necessarily provide accurate information. "
+    "Rely on official information from the Home Front Command."
+)
+FOOTER_ICON = "https://cdn.discordapp.com/emojis/1269243394333343856.webp"
 
-intents = discord.Intents.default()
-intents.message_content = True
-discord_client = discord.Client(intents=intents)
-
-async def background_task():
-    await discord_client.wait_until_ready()
-    discord_channel = discord_client.get_channel(config["discord_channel"])
-    while True:
-        if queue:
-            item = queue.pop(0)
-            message = item.get("message")
-            file_path = item.get("file_path")
-            download_media_coro = item.get("download_media")
-
-            file = None
-            if download_media_coro:
-                try:
-                    await download_media_coro  # Actually download the file now
-                    print(f"Downloaded photo to {file_path}")
-                except Exception as e:
-                    print(f"Error downloading file: {e}")
-                    file_path = None  # Fail gracefully
-
-            if file_path:
-                file = discord.File(file_path)
-
-            try:
-                if item.get("type") == "mannie link":
-                    sent_msg = await discord_channel.send(content=message)
-                else:
-                    embed = discord.Embed(color=discord.Color.red())
-                    if message:
-                        lines = message.splitlines()
-                        if lines:
-                            title = lines[0]
-                            rest = "\n".join(lines[1:]) if len(lines) > 1 else ""
-                            embed.description = f"# {title}\n\n{rest}".strip()
-
-                    if file:
-                        embed.set_image(url=f"attachment://{os.path.basename(file_path)}")
-
-                    embed.set_footer(
-                        text="The bot does not necessarily provide accurate information. Rely on official information from the Home Front Command.",
-                        icon_url="https://cdn.discordapp.com/emojis/1269243394333343856.webp"
-                    )
-
-                    sent_msg = await discord_channel.send(embed=embed, file=file if file else None)
-
-                    global sent_messages
-                    msg_type = item.get("type")
-                    timestamp = time.time()
-                    sent_messages.append({
-                        "id": sent_msg.id,
-                        "timestamp": timestamp,
-                        "type": msg_type
-                    })
-
-                    if msg_type == "red alert map":
-                        five_minutes_ago = timestamp - 240
-                        to_delete_messages = [
-                            msg for msg in sent_messages[:-2]
-                            if msg["type"] in ("red alert map", "red alert info") and msg["timestamp"] >= five_minutes_ago
-                        ]
-
-                        if len(to_delete_messages) > 1 and  to_delete_messages[-1]["type"] == "red alert info":
-                            to_delete_messages.pop()
-
-                        sent_messages = [msg for msg in sent_messages if msg not in to_delete_messages]
-
-                        for sent in to_delete_messages:
-                            temp = await discord_channel.fetch_message(sent["id"])
-                            await temp.delete()
-
-            except Exception as e:
-                print(f"Error sending embed: {e}")
-            finally:
-                if file_path and not file_path.startswith("./resources"):
-                    try:
-                        os.remove(file_path)
-                    except Exception as e:
-                        print(f"Error deleting file {file_path}: {e}")
-
-        await asyncio.sleep(0.5)
+log = logging.getLogger("forwardgram")
 
 
-@discord_client.event
-async def on_ready():
-    print(f'Logged in as {discord_client.user}')
-    discord_client.loop.create_task(background_task())
+@dataclass
+class Post:
+    """Something to send to Discord: a plain link, or an embed with an optional photo."""
+    text: str
+    is_link: bool = False
+    photo_source: Message | None = None  # downloaded just before sending
 
-@client.on(events.NewMessage())
-async def handler(event):
-    if event.chat_id not in input_channel_ids:
-        return
 
-    chat = await event.get_chat()
+# --- Telegram -> Post ---
 
-    if chat.title == "Mannie's War Room":
-        username = chat.username
-        if username:
-            msg_link = f"https://t.me/{username}/{event.message.id}"
-            queue.append({
-                "message": msg_link,
-                "file_path": None,
-                "download_media": None,
-                "type": "mannie link"
-            })
-        return
+def build_post(chat, message: Message) -> Post | None:
+    if chat.title == LINK_ONLY_CHANNEL:
+        return build_link_post(chat, message)
+    return build_embed_post(message)
 
-    file_path = None
-    parsed_response = None
+
+def build_link_post(chat, message: Message) -> Post | None:
+    if not chat.username:
+        return None
+    link = f"https://t.me/{chat.username}/{message.id}"
+    if "foiled" in (message.message or ""):
+        link += f" {FOILED_GIF}"
+    return Post(text=link, is_link=True)
+
+
+def build_embed_post(message: Message) -> Post | None:
+    text = message.message
+    if not text:
+        log.info("Skipped message %s: no text", message.id)
+        return None
+    if any(word in text for word in BLOCKED_WORDS):
+        log.info("Skipped message %s: blocked word in %r", message.id, text[:50])
+        return None
+    return Post(text=text, photo_source=message if message.photo else None)
+
+
+# --- Post -> Discord ---
+
+def build_embed(text: str) -> discord.Embed:
+    title, *rest = text.splitlines() or [""]
+    description = f"**{title}**\n" + "\n".join(rest)
+    embed = discord.Embed(color=discord.Color.red(), description=description.strip())
+    embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
+    return embed
+
+
+async def download_photo(message: Message) -> str | None:
+    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+    path = os.path.join(DOWNLOADS_DIR, f"{message.id}.jpg")
     try:
-        if event.message.photo and not event.message.text:
-            downloads_dir = "downloads"
-            os.makedirs(downloads_dir, exist_ok=True)
-            file_path = os.path.join(downloads_dir, f"{event.message.id}.jpg")
-
-        elif event.message.photo and event.message.text:
-            downloads_dir = "downloads"
-            os.makedirs(downloads_dir, exist_ok=True)
-            file_path = os.path.join(downloads_dir, f"{event.message.id}.jpg")
-            parsed_response = event.message.message
-
-        elif event.message.text:
-            parsed_response = event.message.message
-
-    except Exception as e:
-        print(f"Parsing error: {e}")
-        parsed_response = event.message.message
-
-    if parsed_response:
-        parsed_response, override_file_path = shapira_parse(parsed_response)
-
-    substrings = ["עדכון", "תרגיל", "חומרים", "ראיתם", "חדירת", "ירי", "שבת", "מוגן", "הנחיות", "פיקוד", "Team", "כלי טיס"]
-    blacklist = True
-    if parsed_response:
-        blacklist = all(substring not in parsed_response for substring in substrings)
-
-    if blacklist:
-        if parsed_response and override_file_path:  # Override if shapira_parse provided a file
-            queue.append({
-                "message": parsed_response,
-                "file_path": override_file_path,
-                "download_media": None,  # No need to download, the file is local
-                "type": "incident ended"
-            })
-        elif parsed_response and file_path:
-            queue.append({
-                "message": parsed_response,
-                "file_path": file_path,
-                "download_media": event.message.download_media(file_path),
-                "type": "tzofar early warning"
-            })
-        elif file_path:
-            # Enqueue the coroutine for downloading, not the result
-            queue.append({
-                "message": parsed_response,
-                "file_path": file_path,
-                "download_media": event.message.download_media(file_path),
-                "type": "red alert map"
-            })
-        else:
-            queue.append({
-                "message": parsed_response,
-                "file_path": None,
-                "download_media": None,
-                "type": "red alert info"
-            })
+        return await message.download_media(file=path)
+    except Exception:
+        log.exception("Failed to download photo for message %s; sending without it", message.id)
+        return None
 
 
-async def main():
-    await client.start(phone=config["telegram_phone"])
-    me = await client.get_me()
-    print(f"Logged in to Telegram as {me.username}")
+async def send_post(channel: discord.TextChannel, post: Post) -> None:
+    if post.is_link:
+        await channel.send(content=post.text)
+        return
 
-    global input_channel_ids
-    input_channel_ids = []
+    embed = build_embed(post.text)
+    photo_path = await download_photo(post.photo_source) if post.photo_source else None
+    try:
+        file = None
+        if photo_path:
+            file = discord.File(photo_path)
+            embed.set_image(url=f"attachment://{file.filename}")
+        sent = await channel.send(embed=embed, file=file)
+        log.info("Sent message %s", sent.id)
+    finally:
+        if photo_path:
+            os.remove(photo_path)
 
-    async for d in client.iter_dialogs():
-        if d.name in config["input_channel_names"]:
-            input_channel_ids.append(d.id)
 
-    if not input_channel_ids:
-        print("No input channels found, exiting")
-        exit()
+async def run_sender(channel: discord.TextChannel, queue: asyncio.Queue[Post]) -> None:
+    while True:
+        post = await queue.get()
+        try:
+            await send_post(channel, post)
+        except Exception:
+            log.exception("Failed to send post to Discord")
 
-    await asyncio.gather(
-        discord_client.start(config["discord_bot_token"], reconnect=True),
-        client.run_until_disconnected()
-    )
+
+# --- Wiring ---
+
+async def resolve_channel_ids(telegram: TelegramClient, names: list[str]) -> list[int]:
+    ids = []
+    async for dialog in telegram.iter_dialogs():
+        if dialog.name in names:
+            ids.append(dialog.id)
+            log.info("Monitoring Telegram channel: %s (ID: %s)", dialog.name, dialog.id)
+    return ids
+
+
+async def main() -> None:
+    with open(CONFIG_PATH, "rb") as f:
+        config = yaml.safe_load(f)
+
+    queue: asyncio.Queue[Post] = asyncio.Queue()
+
+    telegram = TelegramClient(SESSION_NAME, config["api_id"], config["api_hash"])
+    await telegram.start(phone=config["telegram_phone"])
+    me = await telegram.get_me()
+    log.info("Logged in to Telegram as %s (%s)", me.username, me.phone)
+
+    channel_ids = await resolve_channel_ids(telegram, config["input_channel_names"])
+    if not channel_ids:
+        log.error("No input channels found matching names in %s, exiting", CONFIG_PATH)
+        return
+
+    @telegram.on(events.NewMessage(chats=channel_ids))
+    async def on_telegram_message(event):
+        post = build_post(await event.get_chat(), event.message)
+        if post:
+            queue.put_nowait(post)
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = discord.Client(intents=intents)
+    sender: asyncio.Task | None = None
+
+    @bot.event
+    async def on_ready():
+        nonlocal sender
+        log.info("Logged in to Discord as %s", bot.user)
+        if sender:  # on_ready fires again after every reconnect
+            return
+        channel = bot.get_channel(config["discord_channel"])
+        if not channel:
+            log.error("Could not find Discord channel with ID %s", config["discord_channel"])
+            return
+        log.info("Found Discord channel: %s", channel.name)
+        sender = asyncio.create_task(run_sender(channel, queue))
+
+    discord_task = asyncio.create_task(bot.start(config["discord_bot_token"], reconnect=True))
+    try:
+        await telegram.run_until_disconnected()
+    finally:
+        discord_task.cancel()
+
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     asyncio.run(main())
